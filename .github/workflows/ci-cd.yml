@@ -1,0 +1,118 @@
+name: CI/CD - Execution Service
+
+on:
+  push:
+    branches: [main, homolog]
+  pull_request:
+    branches: [main, homolog]
+
+permissions:
+  contents: read
+  packages: write
+  id-token: write
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+  AWS_REGION: us-east-1
+  DEPLOYMENT: execution-service
+
+jobs:
+  build-and-test:
+    name: Build, Test & Quality
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+
+      - run: npm ci
+      - run: npm run lint
+      - run: npm run build
+
+      - name: Unit tests (fails below 80% coverage)
+        run: npm run test:cov
+
+      - name: Coverage evidence (job summary + artifact)
+        if: always()
+        run: node scripts/coverage-summary.js >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: coverage-report
+          path: coverage/
+
+      - name: SonarQube scan + quality gate
+        uses: SonarSource/sonarqube-scan-action@v5
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
+
+  docker:
+    name: Build & Push Image
+    needs: build-and-test
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=sha,format=long
+            type=ref,event=branch
+      - uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  # No migrations: the DynamoDB table is managed by Terraform (infra-db).
+  deploy:
+    name: Deploy (${{ github.ref_name }})
+    needs: docker
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    environment: ${{ github.ref_name == 'main' && 'production' || 'homolog' }}
+    env:
+      CLUSTER: ${{ github.ref_name == 'main' && 'auto-repair-prod' || 'auto-repair-homolog' }}
+      ENV: ${{ github.ref_name == 'main' && 'prod' || 'homolog' }}
+      IMAGE: ghcr.io/${{ github.repository }}:sha-${{ github.sha }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - run: aws eks update-kubeconfig --name $CLUSTER --region $AWS_REGION
+
+      # Manifests live in k8s/; ${ACCOUNT_ID} ${ENV} ${IMAGE} are filled here.
+      - name: Apply manifests and roll out
+        run: |
+          export ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+          for f in k8s/*.yaml; do
+            envsubst '${ACCOUNT_ID} ${ENV} ${IMAGE}' < "$f" | kubectl apply -f -
+          done
+          kubectl rollout status deployment/$DEPLOYMENT --timeout=180s
+
+      - name: Smoke test
+        run: |
+          kubectl run execution-smoke --rm -i --restart=Never --image=curlimages/curl -- \
+            curl -fsS http://execution-service/health

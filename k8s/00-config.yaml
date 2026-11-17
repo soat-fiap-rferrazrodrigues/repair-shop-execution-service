@@ -1,0 +1,52 @@
+---
+# execution-service — DynamoDB + fila de execução.
+# Role ARN: output `service_role_arns["execution-service"]` (stack messaging).
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: execution-service
+  annotations:
+    eks.amazonaws.com/role-arn: arn:aws:iam::${ACCOUNT_ID}:role/auto-repair-${ENV}-execution-service
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: execution-service-config
+data:
+  PORT: "3002"
+  DD_SERVICE: execution-service
+  DD_ENV: ${ENV}
+  AWS_REGION: us-east-1
+  # output service_env["execution-service"] (stack messaging)
+  DYNAMODB_TABLE: auto-repair-${ENV}-execution
+  EXECUTION_SNS_TOPIC_ARN: arn:aws:sns:us-east-1:${ACCOUNT_ID}:auto-repair-${ENV}-execution-events
+  EXECUTION_SQS_QUEUE_URL: https://sqs.us-east-1.amazonaws.com/${ACCOUNT_ID}/auto-repair-${ENV}-execution-commands
+---
+apiVersion: external-secrets.io/v1beta1
+kind: ExternalSecret
+metadata:
+  name: execution-service-secrets
+spec:
+  refreshInterval: 1h
+  secretStoreRef:
+    name: aws-secrets-manager
+    kind: SecretStore # namespaced store from infra-k8s/k8s/external-secrets.yaml
+  target:
+    name: execution-service-secrets
+  data:
+    # Same HS256 secret the os-service already reads (ADR-001).
+    - secretKey: JWT_SECRET
+      remoteRef:
+        key: auto-repair-${ENV}/api
+        property: JWT_SECRET
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: execution-service
+spec:
+  selector:
+    app: execution-service
+  ports:
+    - port: 80
+      targetPort: 3002
